@@ -314,6 +314,26 @@ video_index({
 })
 ```
 
+### 4.7 只读评论与楼中楼
+
+`comments` 不需要先建索引，直接给视频链接/BV/av 号即可：
+
+```js
+video_index({
+  action: "comments",
+  url: "https://www.bilibili.com/video/BV...",
+  limit: 30,        // 主评论上限
+  maxSub: 10,       // 每条主评论的楼中楼上限
+  maxSubTotal: 100, // 楼中楼总预算
+  sort: "hot"       // hot | time
+})
+```
+
+- 匿名可用：主评论走 `/x/v2/reply/wbi/main`（WBI 签名 + offset 游标），楼中楼走 `/x/v2/reply/reply`；旧接口只作降级。
+- 稳定字段 `total / rootsFetched / subsFetched / incomplete`；`status` 明确 `LOGIN_REQUIRED`、`RISK_CONTROL`、`COMMENTS_CLOSED`。
+- 只读：不发评论、不点赞、不改播放器、不伪造 cookie。`BILIBILI_SESSDATA` 只用于请求头，不进入返回值。
+- `text` 是压缩摘要，完整结构在 `meta`；要更多就调大 `limit` / `maxSub` / `maxSubTotal`。
+
 ## 5. 实时陪看 `sense_now`
 
 ```js
@@ -409,6 +429,7 @@ profile 是用户选择的分析倾向，不是隐式自动开关。当前包含
 |---|---|
 | `index` | 索引本地文件或 B 站链接；`execution`: `auto` / `sync` / `background`；`rebuild:true` 强制重建 |
 | `query` | 返回受预算限制的检索上下文和引用；可能附带 `refinement` |
+| `comments` | 只读抓 B 站主评论与楼中楼（未登录可翻页）；`limit` / `maxSub` / `maxSubTotal` / `sort` |
 | `evidence` | 按 id 或时间范围取证；`package`: `minimal` / `full` |
 | `zoom` | 在已索引的时间窗口补一张完整画面或 ROI |
 | `status` / `list` | 查看索引 |

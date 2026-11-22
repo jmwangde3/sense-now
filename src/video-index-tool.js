@@ -14,6 +14,7 @@ import {
 } from './video-index/evidence-package.js';
 import { TOOL_TIMEOUT_MS } from './tool-spec.js';
 import { estimateTextTokens } from './video-index/token-gate.js';
+import { createBilibiliComments } from './video-index/adapters/bilibili-comments.js';
 
 /** query 可见 text 的硬上限（模型读不到 meta）。 */
 export const QUERY_TEXT_LIMITS = Object.freeze({
@@ -37,6 +38,12 @@ function foldUtteranceText(text, max = QUERY_TEXT_LIMITS.maxCharsPerUtterance) {
   const flat = String(text || '').replace(/\s+/g, ' ').trim();
   if (flat.length <= max) return flat;
   return `${flat.slice(0, max)}…`;
+}
+
+function clampInt(value, fallback, min, max) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, Math.floor(n)));
 }
 
 function citeIds(ids) {
@@ -111,6 +118,86 @@ export function formatQueryToolText(r = {}) {
   return lines.join('\n');
 }
 
+function foldCommentText(text, max) {
+  const flat = String(text || '').replace(/\s*\n+\s*/g, ' / ').replace(/[ \t]+/g, ' ').trim();
+  if (flat.length <= max) return flat;
+  return `${flat.slice(0, max)}…`;
+}
+
+/**
+ * 模型可见的 comments 摘要：状态行 + 少量正文；完整结构在 meta。
+ * 评论区可能几千条，默认只展开 10 条主评论、每条 3 条楼中楼。
+ */
+export function formatCommentsToolText(r = {}, {
+  maxRoots = 10,
+  maxSubsPerRoot = 3,
+  maxChars = 160,
+} = {}) {
+  const meta = r.meta || {};
+  const login = meta.login || {};
+  const lines = [
+    `comments status=${r.status || 'unknown'} total=${r.total ?? 0} `
+      + `rootsFetched=${r.rootsFetched ?? 0} subsFetched=${r.subsFetched ?? 0} `
+      + `incomplete=${r.incomplete ? 'true' : 'false'}`,
+    `reasons: ${(r.reasons || []).join(', ') || '-'}`,
+    `video: ${meta.bvid || meta.aid || '-'}`
+      + `${meta.title ? ` 《${meta.title}》` : ''}`
+      + `${meta.up ? ` | UP ${meta.up}` : ''}`,
+    `backend=${meta.backend || '-'} sort=${meta.sort || '-'} `
+      + `login=${login.loggedIn ? (login.uname || 'yes') : 'anonymous'}`,
+  ];
+  if (r.error) lines.push(`error: ${r.error}`);
+  for (const warning of r.warnings || []) lines.push(`! ${warning}`);
+
+  const pinned = Array.isArray(r.pinned) ? r.pinned : [];
+  const roots = Array.isArray(r.roots) ? r.roots : [];
+  if (!roots.length && !pinned.length) {
+    lines.push('--- 没有可展示的评论 ---');
+    return lines.join('\n');
+  }
+
+  if (pinned.length) {
+    lines.push('--- pinned ---');
+    for (const item of pinned.slice(0, 3)) {
+      lines.push(`置顶 · ${item.uname}${item.isUp ? '（UP主）' : ''} · ${item.likes}赞 · ${item.time}`);
+      lines.push(`  ${foldCommentText(item.message, maxChars)}`);
+    }
+  }
+
+  lines.push('--- comments ---');
+  const shown = roots.slice(0, maxRoots);
+  for (const [index, root] of shown.entries()) {
+    const tags = [];
+    if (root.isUp) tags.push('UP主');
+    if (root.location) tags.push(root.location);
+    lines.push(
+      `[${index + 1}] ${root.uname}${tags.length ? ` · ${tags.join(' · ')}` : ''}`
+        + ` · ${root.likes}赞 · ${root.time}`
+        + (root.rcount ? ` · ${root.rcount}回复(已抓${root.subsFetched})` : '')
+        + ` · rpid=${root.rpid}`,
+    );
+    lines.push(`  ${foldCommentText(root.message, maxChars)}${root.hasImage ? ' [图片]' : ''}`);
+    if (!(root.replies || []).length && root.rcount > 0) {
+      lines.push(r.reasons?.includes('subs_disabled')
+        ? '  - （已按需跳过楼中楼）'
+        : '  - （楼中楼预算已用尽，可调大 maxSub / maxSubTotal）');
+    }
+    for (const sub of (root.replies || []).slice(0, maxSubsPerRoot)) {
+      lines.push(
+        `  - ${sub.uname}${sub.isUp ? '（UP主）' : ''} · ${sub.likes}赞`
+          + `${sub.location ? ` · ${sub.location}` : ''}：`
+          + `${foldCommentText(sub.message, maxChars)}${sub.hasImage ? ' [图片]' : ''}`,
+      );
+    }
+    const subOmitted = Math.max(0, (root.replies || []).length - maxSubsPerRoot);
+    if (subOmitted > 0) lines.push(`  - …另有 ${subOmitted} 条楼中楼未展开`);
+  }
+  if (roots.length > shown.length) {
+    lines.push(`--- omitted --- 另有 ${roots.length - shown.length} 条主评论未展开（完整内容在 meta）`);
+  }
+  return lines.join('\n');
+}
+
 export function videoIndexToolSpec() {
   return {
     name: 'video_index',
@@ -120,6 +207,9 @@ export function videoIndexToolSpec() {
       + 'Actions:\n'
       + '- `index` — index a local file (`path`) or Bilibili URL (`url`). Same source reuses ready index unless `rebuild:true`.\n'
       + '- `query` — retrieve evidence for a question (does NOT invent the final answer).\n'
+      + '- `comments` — read-only Bilibili comments + nested replies (楼中楼) by `url`; WBI pagination, '
+      + 'works without login. Returns total / rootsFetched / subsFetched / incomplete plus explicit '
+      + 'LOGIN_REQUIRED / RISK_CONTROL status. Never posts, likes, or fakes a login cookie.\n'
       + '- `evidence` — fetch controlled evidence refs by id / time range.\n'
       + '- `zoom` — request a local zoom frame for an indexed time range (budget-limited).\n'
       + '- `status` / `list` / `remove` — inspect or delete one videoKey.\n'
@@ -137,7 +227,7 @@ export function videoIndexToolSpec() {
     parameters: {
       action: {
         type: 'string',
-        description: 'index | query | evidence | zoom | status | list | remove | cleanup | job_status | job_cancel | job_resume | capture_start | capture_stop | refine | execute_refinement',
+        description: 'index | comments | query | evidence | zoom | status | list | remove | cleanup | job_status | job_cancel | job_resume | capture_start | capture_stop | refine | execute_refinement',
       },
       planHash: {
         type: 'string',
@@ -165,7 +255,28 @@ export function videoIndexToolSpec() {
         description: 'file | bilibili (for index)',
       },
       path: { type: 'string', description: 'Local video path (source:file)' },
-      url: { type: 'string', description: 'Bilibili URL (source:bilibili)' },
+      url: {
+        type: 'string',
+        description: 'With index: full https://*.bilibili.com URL. '
+          + 'With comments: the same, or a bare BV / av id.',
+      },
+      limit: {
+        type: 'integer',
+        description: 'With comments: max root comments to fetch (default 30, cap 500). '
+          + 'Raise it for "read the whole comment section"; keep it small for a quick read.',
+      },
+      maxSub: {
+        type: 'integer',
+        description: 'With comments: max nested replies per root (default 10, 0 = none).',
+      },
+      maxSubTotal: {
+        type: 'integer',
+        description: 'With comments: total nested-reply budget (default 100, 0 = none).',
+      },
+      sort: {
+        type: 'string',
+        description: 'With comments: hot (default, 按热度) | time (按时间)',
+      },
       partId: { type: 'string', description: 'Bilibili part id, default p1' },
       subtitlePath: {
         type: 'string',
@@ -322,6 +433,8 @@ export function createVideoIndexTool({
     adapters,
     log,
   });
+  // 评论只读、与索引解耦：单独实例，测试可注入 adapters.bilibiliComments
+  const commentsAdapter = adapters.bilibiliComments || createBilibiliComments({ log });
 
   async function loadPngForUnit(videoKey, unit) {
     const view = eng.loadQueryableIndex(videoKey);
@@ -405,6 +518,37 @@ export function createVideoIndexTool({
               reason: e.code || 'index_failed',
               error: String(e.message),
             },
+          };
+        }
+      }
+
+      if (action === 'comments') {
+        const url = args.url ? String(args.url) : '';
+        if (!url) {
+          return {
+            text: 'comments 需要 url（B 站视频链接、BV 号或 av 号）。',
+            meta: { ok: false, status: 'BAD_TARGET', reason: 'missing_url' },
+          };
+        }
+        try {
+          const r = await commentsAdapter.fetchComments({
+            url,
+            limit: clampInt(args.limit, 30, 1, 500),
+            maxSub: clampInt(args.maxSub, 10, 0, 200),
+            maxSubTotal: clampInt(args.maxSubTotal, 100, 0, 2000),
+            sort: String(args.sort || 'hot').toLowerCase() === 'time' ? 'time' : 'hot',
+            signal,
+            onProgress: (message) => log(message),
+          });
+          return {
+            text: formatCommentsToolText(r),
+            meta: toLosslessJson(r),
+          };
+        } catch (e) {
+          if (e.name === 'AbortError') throw e;
+          return {
+            text: `读取评论失败：${e.message}`,
+            meta: { ok: false, status: 'UNAVAILABLE', error: String(e.message) },
           };
         }
       }
@@ -757,7 +901,7 @@ export function createVideoIndexTool({
       }
 
       return {
-        text: `未知 action: ${action}（可用 index / query / evidence / zoom / status / list / remove / cleanup / job_* / capture_* / refine / execute_refinement）`,
+        text: `未知 action: ${action}（可用 index / comments / query / evidence / zoom / status / list / remove / cleanup / job_* / capture_* / refine / execute_refinement）`,
         meta: { action },
       };
     },

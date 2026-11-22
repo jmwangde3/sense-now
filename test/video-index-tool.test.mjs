@@ -488,3 +488,71 @@ test('索引没有文本证据时明确说明，而不是留两个空段', async
   assert.match(q.text, /没有可引用的文本证据/);
   assert.equal(q.text.includes('--- utterances ---'), false);
 });
+
+test('video_index comments：透传分页参数，文本含 total/rootsFetched/subsFetched/incomplete', async () => {
+  let received = null;
+  const fake = {
+    async fetchComments(input) {
+      received = input;
+      return {
+        ok: true,
+        status: 'ok',
+        error: null,
+        meta: {
+          bvid: 'BV17x411w7KC',
+          aid: 170001,
+          title: '演示',
+          up: 'UP主',
+          backend: 'x/v2/reply/wbi/main',
+          sort: 'hot',
+          login: { loggedIn: false },
+        },
+        total: 10,
+        rootsFetched: 2,
+        subsFetched: 1,
+        incomplete: true,
+        reasons: ['main_limit'],
+        warnings: ['样例警告'],
+        pinned: [],
+        roots: [{
+          rpid: '1',
+          uname: 'alice',
+          likes: 2,
+          time: '2023-11-14 22:13',
+          rcount: 1,
+          subsFetched: 1,
+          isUp: false,
+          location: '上海',
+          message: '主评论正文',
+          hasImage: false,
+          replies: [{
+            uname: 'bob', likes: 1, time: '2023-11-14 22:14', message: '楼中楼', isUp: false, location: '', hasImage: false,
+          }],
+        }],
+      };
+    },
+  };
+  const tool = createVideoIndexTool({ rootDir: 'unused', engine: {}, adapters: { bilibiliComments: fake } });
+  const r = await tool.execute({
+    action: 'comments',
+    url: 'BV17x411w7KC',
+    limit: 5,
+    maxSub: 2,
+    maxSubTotal: 7,
+    sort: 'time',
+  });
+
+  assert.equal(badJson(r), null);
+  assert.match(r.text, /comments status=ok total=10 rootsFetched=2 subsFetched=1 incomplete=true/);
+  assert.match(r.text, /incomplete=true/);
+  assert.match(r.text, /样例警告/);
+  assert.match(r.text, /\[1\] alice/);
+  assert.match(r.text, /楼中楼/);
+  assert.equal(received.limit, 5);
+  assert.equal(received.maxSub, 2);
+  assert.equal(received.maxSubTotal, 7);
+  assert.equal(received.sort, 'time');
+
+  const missing = await tool.execute({ action: 'comments' });
+  assert.match(missing.text, /需要 url/);
+});
